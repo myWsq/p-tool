@@ -13,18 +13,40 @@
 
 ## 安装
 
+### 通过 GitHub Releases 安装（推荐）
+
+访问 [Releases 页面](https://github.com/mywsq/p-tool/releases) 下载对应平台的二进制文件：
+
+**Linux/macOS:**
+```bash
+# 下载对应架构的二进制文件
+wget https://github.com/mywsq/p-tool/releases/latest/download/p-tool_linux_amd64.tar.gz
+tar -xzf p-tool_linux_amd64.tar.gz
+sudo mv p-tool /usr/local/bin/
+```
+
+**macOS (Apple Silicon):**
+```bash
+wget https://github.com/mywsq/p-tool/releases/latest/download/p-tool_darwin_arm64.tar.gz
+tar -xzf p-tool_darwin_arm64.tar.gz
+sudo mv p-tool /usr/local/bin/
+```
+
+**Windows:**
+下载 `p-tool_windows_amd64.tar.gz`，解压后将 `p-tool.exe` 添加到系统 PATH。
+
+### 使用 Go 安装
+
+```bash
+go install github.com/mywsq/p-tool@latest
+```
+
 ### 从源码编译
 
 ```bash
 git clone https://github.com/mywsq/p-tool.git
 cd p-tool
 go build -o p-tool
-```
-
-### 使用 Go 安装
-
-```bash
-go install github.com/mywsq/p-tool@latest
 ```
 
 ## 使用方法
