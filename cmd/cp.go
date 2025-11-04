@@ -114,7 +114,7 @@ var cpCmd = &cobra.Command{
 
 		// 预创建所有目录（小文件场景优化：避免并发时重复创建目录）
 		fmt.Fprintf(os.Stdout, "预创建目录结构中...\n")
-		if err := precreateDirectories(absDestDir, fileList); err != nil {
+		if err := precreateDirectories(absDestDir, fileList, concurrency); err != nil {
 			fmt.Fprintf(os.Stderr, "警告: 预创建目录失败，将按需创建: %v\n", err)
 		}
 
@@ -246,8 +246,9 @@ func copyFilesParallel(sourceDir, destDir string, fileList []string, concurrency
 	return nil
 }
 
-// precreateDirectories 预创建所有需要的目录（小文件场景优化）
-func precreateDirectories(baseDir string, fileList []string) error {
+// precreateDirectories 预创建所有需要的目录（并行优化版本）
+func precreateDirectories(baseDir string, fileList []string, concurrency int) error {
+	// 收集所有需要的目录
 	dirSet := make(map[string]bool)
 	for _, relPath := range fileList {
 		dir := filepath.Dir(relPath)
@@ -256,33 +257,94 @@ func precreateDirectories(baseDir string, fileList []string) error {
 		}
 	}
 
-	// 按深度排序，确保父目录先创建（使用更高效的排序）
+	if len(dirSet) == 0 {
+		return nil
+	}
+
+	// 转换为切片并按深度排序（从深到浅）
 	dirs := make([]string, 0, len(dirSet))
 	for dir := range dirSet {
 		dirs = append(dirs, dir)
 	}
 
-	// 使用 sort.Slice 进行排序（按路径深度和字典序）
-	// 这里使用简单的插入排序，因为目录数量通常不会太多
+	// 按路径长度从长到短排序（最深的在前）
 	for i := 1; i < len(dirs); i++ {
 		key := dirs[i]
 		j := i - 1
-		for j >= 0 && (len(dirs[j]) > len(key) || (len(dirs[j]) == len(key) && dirs[j] > key)) {
+		for j >= 0 && len(dirs[j]) < len(key) {
 			dirs[j+1] = dirs[j]
 			j--
 		}
 		dirs[j+1] = key
 	}
 
-	// 创建所有目录（MkdirAll 本身会处理父目录，所以顺序不是严格必需的，但可以避免一些重复检查）
-	for _, dir := range dirs {
-		fullPath := filepath.Join(baseDir, dir)
-		if err := os.MkdirAll(fullPath, 0755); err != nil {
-			return fmt.Errorf("创建目录失败 %s: %w", fullPath, err)
+	// 筛选出互斥的最深层目录（没有其他目录是它的子目录）
+	// 因为已经按深度从深到浅排序，所以只需要检查是否有更深的目录是当前目录的子目录
+	mutualExclusiveDirs := make([]string, 0)
+	sep := string(filepath.Separator)
+	for i, dir := range dirs {
+		hasChildDir := false
+		// 检查是否有更深的目录（已排序，所以只检查前面的）是当前目录的子目录
+		for j := 0; j < i; j++ {
+			// 检查 dirs[j] 是否是 dir 的子目录
+			// 使用标准化的路径比较，确保正确识别父子关系
+			childPath := dirs[j]
+			parentPath := dir + sep
+			if strings.HasPrefix(childPath, parentPath) {
+				hasChildDir = true
+				break
+			}
+		}
+		// 如果没有子目录，说明这是最深层叶子目录，需要创建
+		if !hasChildDir {
+			mutualExclusiveDirs = append(mutualExclusiveDirs, dir)
 		}
 	}
 
-	return nil
+	if len(mutualExclusiveDirs) == 0 {
+		return nil
+	}
+
+	// 并行创建互斥的最深层目录
+	// 使用传入的并发数，但不超过实际需要创建的目录数
+	actualConcurrency := concurrency
+	if actualConcurrency > len(mutualExclusiveDirs) {
+		actualConcurrency = len(mutualExclusiveDirs)
+	}
+
+	taskChan := make(chan string, len(mutualExclusiveDirs))
+	var wg sync.WaitGroup
+	var firstErr error
+	var mu sync.Mutex
+
+	// 启动工作协程
+	for i := 0; i < actualConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for dir := range taskChan {
+				fullPath := filepath.Join(baseDir, dir)
+				if err := os.MkdirAll(fullPath, 0755); err != nil {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("创建目录失败 %s: %w", fullPath, err)
+					}
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+
+	// 发送任务
+	for _, dir := range mutualExclusiveDirs {
+		taskChan <- dir
+	}
+	close(taskChan)
+
+	// 等待所有协程完成
+	wg.Wait()
+
+	return firstErr
 }
 
 // copyFile 复制单个文件（小文件场景优化版本）
