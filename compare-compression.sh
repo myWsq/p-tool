@@ -72,6 +72,9 @@ TOTAL_TESTS=0
 # 计算总测试数
 if [ "$SKIP_PTOOL" = false ]; then
     TOTAL_TESTS=$((TOTAL_TESTS + 1))  # p-tool tar-multi
+    if [ "$TAR_SUPPORTS_ZSTD" = true ]; then
+        TOTAL_TESTS=$((TOTAL_TESTS + 1))  # p-tool tar-multi --zstd
+    fi
 fi
 TOTAL_TESTS=$((TOTAL_TESTS + 1))  # 系统 tar (无压缩)
 if [ "$TAR_SUPPORTS_ZSTD" = true ]; then
@@ -189,6 +192,58 @@ if [ "$SKIP_PTOOL" = false ]; then
     echo ""
 fi
 
+# 测试 1.5: p-tool tar-multi --zstd (如果系统 tar 支持 zstd)
+if [ "$SKIP_PTOOL" = false ] && [ "$TAR_SUPPORTS_ZSTD" = true ]; then
+    TEST_NUM=$((TEST_NUM + 1))
+    echo "[$TEST_NUM/$TOTAL_TESTS] 测试 p-tool tar-multi --zstd..."
+    OUTPUT_DIR="$TEMP_DIR/ptool-tar-multi-zstd"
+    mkdir -p "$OUTPUT_DIR"
+    START_TIME=$(get_timestamp)
+    if $PTOOL_CMD tar-multi "$SOURCE_DIR" "$OUTPUT_DIR" --zstd 2>/dev/null; then
+        END_TIME=$(get_timestamp)
+        ELAPSED=$(awk "BEGIN {printf \"%.3f\", $END_TIME - $START_TIME}")
+        # 计算所有 tar.zst 文件的总大小
+        SIZE=0
+        for tar_file in "$OUTPUT_DIR"/part-*.tar.zst; do
+            if [ -f "$tar_file" ]; then
+                file_size=$(get_file_size "$tar_file")
+                SIZE=$((SIZE + file_size))
+            fi
+        done
+        RESULTS+=("$SIZE")
+        TIMES+=("$ELAPSED")
+        COMPRESS_FILES+=("$OUTPUT_DIR")
+        USE_ZSTD_FLAGS+=("true")
+        METHODS+=("p-tool tar-multi --zstd")
+        echo "  ✓ 压缩完成: $(format_size $SIZE) | 耗时: $(format_time $ELAPSED)"
+        
+        # 测试解压缩
+        echo "  测试解压缩..."
+        EXTRACT_DIR="$TEMP_DIR/extract-ptool-tar-multi-zstd"
+        mkdir -p "$EXTRACT_DIR"
+        START_TIME=$(get_timestamp)
+        if $PTOOL_CMD untar-multi "$OUTPUT_DIR" "$EXTRACT_DIR" --zstd 2>/dev/null; then
+            END_TIME=$(get_timestamp)
+            UNCOMPRESS_ELAPSED=$(awk "BEGIN {printf \"%.3f\", $END_TIME - $START_TIME}")
+            UNCOMPRESS_TIMES+=("$UNCOMPRESS_ELAPSED")
+            echo "  ✓ 解压完成: 耗时: $(format_time $UNCOMPRESS_ELAPSED)"
+        else
+            UNCOMPRESS_TIMES+=("0")
+            echo "  ✗ 解压失败"
+        fi
+        rm -rf "$EXTRACT_DIR"
+    else
+        RESULTS+=("0")
+        TIMES+=("0")
+        COMPRESS_FILES+=("")
+        USE_ZSTD_FLAGS+=("true")
+        UNCOMPRESS_TIMES+=("0")
+        METHODS+=("p-tool tar-multi --zstd")
+        echo "  ✗ 失败"
+    fi
+    echo ""
+fi
+
 # 测试 2: 系统 tar (不加压缩)
 TEST_NUM=$((TEST_NUM + 1))
 echo "[$TEST_NUM/$TOTAL_TESTS] 测试系统 tar (不加压缩)..."
@@ -298,6 +353,15 @@ for i in "${!METHODS[@]}"; do
             fi
         done
         RESULTS[$i]=$SIZE
+    elif [ "$METHOD" = "p-tool tar-multi --zstd" ] && [ -d "${COMPRESS_FILES[$i]}" ]; then
+        SIZE=0
+        for tar_file in "${COMPRESS_FILES[$i]}"/part-*.tar.zst; do
+            if [ -f "$tar_file" ]; then
+                file_size=$(get_file_size "$tar_file")
+                SIZE=$((SIZE + file_size))
+            fi
+        done
+        RESULTS[$i]=$SIZE
     fi
 done
 
@@ -335,6 +399,15 @@ for i in "${!METHODS[@]}"; do
     if [ "$METHOD" = "p-tool tar-multi" ] && [ -d "${COMPRESS_FILES[$i]}" ]; then
         SIZE=0
         for tar_file in "${COMPRESS_FILES[$i]}"/part-*.tar; do
+            if [ -f "$tar_file" ]; then
+                file_size=$(get_file_size "$tar_file")
+                SIZE=$((SIZE + file_size))
+            fi
+        done
+        RESULTS[$i]=$SIZE
+    elif [ "$METHOD" = "p-tool tar-multi --zstd" ] && [ -d "${COMPRESS_FILES[$i]}" ]; then
+        SIZE=0
+        for tar_file in "${COMPRESS_FILES[$i]}"/part-*.tar.zst; do
             if [ -f "$tar_file" ]; then
                 file_size=$(get_file_size "$tar_file")
                 SIZE=$((SIZE + file_size))
