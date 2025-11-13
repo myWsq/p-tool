@@ -26,7 +26,7 @@ var cpCmd = &cobra.Command{
 
 支持的功能：
 - 自动创建目标目录
-- 自动生成 manifest 文件（如果未指定）
+- 自动在内存中生成 manifest 列表（如果未指定 manifest 文件）
 - 并行复制文件，提高复制速度
 - 显示复制进度
 
@@ -60,31 +60,23 @@ var cpCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		// 如果未指定 manifest 文件，自动生成
+		var fileList []string
+
+		// 如果未指定 manifest 文件，在内存中生成
 		if manifestFile == "" {
-			tmpFile, err := os.CreateTemp("", "p-tool-manifest-*.txt")
+			var err error
+			fileList, err = GenerateManifestInMemory(absSourceDir)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "错误: 无法创建临时 manifest 文件: %v\n", err)
+				fmt.Fprintf(os.Stderr, "错误: 生成 manifest 失败: %v\n", err)
 				os.Exit(1)
 			}
-			tmpFile.Close()
-			manifestFile = tmpFile.Name()
-
-			// 使用共享的 GenerateManifest 函数扫描源目录
-			if err := GenerateManifest(absSourceDir, manifestFile); err != nil {
-				os.Remove(manifestFile)
-				fmt.Fprintf(os.Stderr, "错误: 生成 manifest 文件失败: %v\n", err)
+		} else {
+			// 读取 manifest 文件
+			fileList, err = readManifest(manifestFile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "错误: 读取 manifest 文件失败: %v\n", err)
 				os.Exit(1)
 			}
-
-			fmt.Fprintf(os.Stdout, "提示: 已自动生成 manifest 文件: %s\n", manifestFile)
-		}
-
-		// 读取 manifest 文件
-		fileList, err := readManifest(manifestFile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "错误: 读取 manifest 文件失败: %v\n", err)
-			os.Exit(1)
 		}
 
 		if len(fileList) == 0 {

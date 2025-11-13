@@ -7,26 +7,23 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
 
-// GenerateManifest 扫描指定目录并生成 manifest 文件
+// scanDirectory 扫描指定目录并收集文件相对路径列表（内部函数）
 // dirPath: 要扫描的目录路径（可以是相对路径或绝对路径）
-// manifestPath: manifest 文件的输出路径
-func GenerateManifest(dirPath, manifestPath string) error {
-	// 创建 manifest 文件
-	manifestFile, err := os.Create(manifestPath)
-	if err != nil {
-		return fmt.Errorf("无法创建 manifest 文件: %w", err)
-	}
-	defer manifestFile.Close()
-
+// 返回文件相对路径列表（使用 ./ 前缀格式）
+func scanDirectory(dirPath string) ([]string, error) {
 	// 获取目录的绝对路径，用于计算相对路径
 	absDirPath, err := filepath.Abs(dirPath)
 	if err != nil {
-		return fmt.Errorf("无法获取目录绝对路径: %w", err)
+		return nil, fmt.Errorf("无法获取目录绝对路径: %w", err)
 	}
+
+	// 用于存储文件列表
+	var fileList []string
 
 	// 用于跟踪已访问的路径（解析后的真实路径），防止无限递归
 	visited := make(map[string]bool)
@@ -67,7 +64,7 @@ func GenerateManifest(dirPath, manifestPath string) error {
 			return nil
 		}
 
-		// 如果是文件（非目录），记录到 manifest
+		// 如果是文件（非目录），记录到列表
 		if !info.IsDir() {
 			// 计算相对路径（使用原始路径，保持符号链接的结构）
 			relPath, err := filepath.Rel(absDirPath, absCurrentPath)
@@ -75,11 +72,9 @@ func GenerateManifest(dirPath, manifestPath string) error {
 				// 如果无法计算相对路径，跳过
 				return nil
 			}
-			// 写入文件，格式为 ./relative/path
-			_, err = fmt.Fprintf(manifestFile, "./%s\n", filepath.ToSlash(relPath))
-			if err != nil {
-				return err
-			}
+			// 转换为斜杠格式，格式为 ./relative/path
+			relPath = filepath.ToSlash(relPath)
+			fileList = append(fileList, "./"+relPath)
 			return nil
 		}
 
@@ -109,10 +104,57 @@ func GenerateManifest(dirPath, manifestPath string) error {
 	// 开始遍历
 	err = walkDir(dirPath, dirPath)
 	if err != nil {
-		return fmt.Errorf("扫描目录时出错: %w", err)
+		return nil, fmt.Errorf("扫描目录时出错: %w", err)
+	}
+
+	return fileList, nil
+}
+
+// GenerateManifest 扫描指定目录并生成 manifest 文件
+// dirPath: 要扫描的目录路径（可以是相对路径或绝对路径）
+// manifestPath: manifest 文件的输出路径
+func GenerateManifest(dirPath, manifestPath string) error {
+	// 扫描目录获取文件列表
+	fileList, err := scanDirectory(dirPath)
+	if err != nil {
+		return err
+	}
+
+	// 创建 manifest 文件
+	manifestFile, err := os.Create(manifestPath)
+	if err != nil {
+		return fmt.Errorf("无法创建 manifest 文件: %w", err)
+	}
+	defer manifestFile.Close()
+
+	// 写入文件列表
+	for _, relPath := range fileList {
+		_, err = fmt.Fprintf(manifestFile, "%s\n", relPath)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
+}
+
+// GenerateManifestInMemory 扫描指定目录并在内存中生成 manifest 列表
+// dirPath: 要扫描的目录路径（可以是相对路径或绝对路径）
+// 返回文件相对路径列表（已移除 ./ 前缀）
+func GenerateManifestInMemory(dirPath string) ([]string, error) {
+	// 扫描目录获取文件列表
+	fileList, err := scanDirectory(dirPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// 移除 ./ 前缀
+	result := make([]string, len(fileList))
+	for i, path := range fileList {
+		result[i] = strings.TrimPrefix(path, "./")
+	}
+
+	return result, nil
 }
 
 // manifestCmd represents the manifest command
