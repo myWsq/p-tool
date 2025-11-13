@@ -111,12 +111,12 @@ func init() {
 	tarCmd.Flags().Bool("zstd", false, "使用 zstd 算法压缩 tar 包")
 }
 
-// fileData 用于在 goroutine 之间传递文件数据
-type fileData struct {
-	relPath string
-	content []byte
-	header  *tar.Header
-	err     error
+// tarBufferPool 缓冲区池，用于复用缓冲区减少内存分配
+var tarBufferPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 256*1024)
+		return &buf
+	},
 }
 
 // createTarParallel 并行读取文件并生成 tar 包
@@ -135,8 +135,8 @@ func createTarParallel(sourceDir, outputFile string, fileList []string, concurre
 	}
 	defer outFile.Close()
 
-	// 创建带缓冲的 writer 提高性能
-	bufferedWriter := bufio.NewWriterSize(outFile, 64*1024)
+	// 创建带缓冲的 writer 提高性能（增大缓冲区到 256KB）
+	bufferedWriter := bufio.NewWriterSize(outFile, 256*1024)
 
 	// 根据 useZstd 标志决定是否使用 zstd 压缩
 	var writer io.Writer = bufferedWriter
@@ -160,12 +160,11 @@ func createTarParallel(sourceDir, outputFile string, fileList []string, concurre
 		bufferedWriter.Flush()
 	}()
 
-	// 创建任务通道和数据通道
+	// 创建任务通道
 	taskChan := make(chan string, concurrency*2)
-	dataChan := make(chan *fileData, concurrency*2)
 
 	var wg sync.WaitGroup
-	var mu sync.Mutex
+	var mu sync.Mutex // 保护 tarWriter 的并发写入
 
 	// 启动进度更新协程
 	progressDone := make(chan struct{})
@@ -182,66 +181,75 @@ func createTarParallel(sourceDir, outputFile string, fileList []string, concurre
 		}
 	}()
 
-	// 启动文件读取工作协程（并行读取文件）
+	// 启动文件处理工作协程（并行读取文件并流式写入 tar）
+	var writeErr error
+	var writeErrMu sync.Mutex
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for relPath := range taskChan {
-				data := &fileData{relPath: relPath}
-				data.content, data.header, data.err = readFileForTar(sourceDir, relPath)
-				dataChan <- data
+				// 如果已经有写入错误，跳过后续处理
+				writeErrMu.Lock()
+				if writeErr != nil {
+					writeErrMu.Unlock()
+					atomic.AddInt64(&processedFiles, 1)
+					continue
+				}
+				writeErrMu.Unlock()
+
+				// 读取文件 header（不读内容）
+				header, err := readFileHeaderForTar(sourceDir, relPath)
+				if err != nil {
+					mu.Lock()
+					if os.IsNotExist(err) {
+						fmt.Fprintf(os.Stderr, "警告: 源文件不存在: %s\n", filepath.Join(sourceDir, relPath))
+					} else {
+						fmt.Fprintf(os.Stderr, "警告: 读取文件失败 %s: %v\n", relPath, err)
+					}
+					mu.Unlock()
+					atomic.AddInt64(&failedFiles, 1)
+					atomic.AddInt64(&processedFiles, 1)
+					continue
+				}
+
+				// 加锁保护 tarWriter（tar 格式要求串行写入）
+				mu.Lock()
+				// 再次检查错误
+				writeErrMu.Lock()
+				if writeErr != nil {
+					writeErrMu.Unlock()
+					mu.Unlock()
+					atomic.AddInt64(&processedFiles, 1)
+					continue
+				}
+				writeErrMu.Unlock()
+
+				// 写入 tar header
+				if err := tarWriter.WriteHeader(header); err != nil {
+					writeErrMu.Lock()
+					writeErr = fmt.Errorf("写入 tar header 失败 %s: %w", relPath, err)
+					writeErrMu.Unlock()
+					mu.Unlock()
+					atomic.AddInt64(&processedFiles, 1)
+					return
+				}
+
+				// 流式写入文件内容
+				if err := writeFileContentToTar(sourceDir, relPath, tarWriter); err != nil {
+					writeErrMu.Lock()
+					writeErr = fmt.Errorf("写入文件内容失败 %s: %w", relPath, err)
+					writeErrMu.Unlock()
+					mu.Unlock()
+					atomic.AddInt64(&processedFiles, 1)
+					return
+				}
+
+				mu.Unlock()
+				atomic.AddInt64(&processedFiles, 1)
 			}
 		}()
 	}
-
-	// 启动写入协程（串行写入 tar，保证格式正确）
-	writeDone := make(chan struct{})
-	var writeErr error
-	go func() {
-		defer close(writeDone)
-		processedCount := int64(0)
-		for processedCount < totalFiles {
-			data, ok := <-dataChan
-			if !ok {
-				// 通道已关闭，但还没处理完所有文件，说明有错误
-				if processedCount < totalFiles {
-					writeErr = fmt.Errorf("数据通道意外关闭，已处理 %d/%d 个文件", processedCount, totalFiles)
-				}
-				return
-			}
-
-			processedCount++
-			if data.err != nil {
-				mu.Lock()
-				if os.IsNotExist(data.err) {
-					fmt.Fprintf(os.Stderr, "警告: 源文件不存在: %s\n", filepath.Join(sourceDir, data.relPath))
-				} else {
-					fmt.Fprintf(os.Stderr, "警告: 读取文件失败 %s: %v\n", data.relPath, data.err)
-				}
-				mu.Unlock()
-				atomic.AddInt64(&failedFiles, 1)
-				atomic.AddInt64(&processedFiles, 1)
-				continue
-			}
-
-			// 写入 tar header
-			if err := tarWriter.WriteHeader(data.header); err != nil {
-				writeErr = fmt.Errorf("写入 tar header 失败 %s: %w", data.relPath, err)
-				atomic.AddInt64(&processedFiles, 1)
-				return
-			}
-
-			// 写入文件内容
-			if _, err := tarWriter.Write(data.content); err != nil {
-				writeErr = fmt.Errorf("写入文件内容失败 %s: %w", data.relPath, err)
-				atomic.AddInt64(&processedFiles, 1)
-				return
-			}
-
-			atomic.AddInt64(&processedFiles, 1)
-		}
-	}()
 
 	// 发送任务
 	for _, relPath := range fileList {
@@ -249,12 +257,8 @@ func createTarParallel(sourceDir, outputFile string, fileList []string, concurre
 	}
 	close(taskChan)
 
-	// 等待所有读取协程完成
+	// 等待所有工作协程完成
 	wg.Wait()
-	close(dataChan)
-
-	// 等待写入协程完成
-	<-writeDone
 
 	// 停止进度更新协程
 	close(progressDone)
@@ -263,8 +267,11 @@ func createTarParallel(sourceDir, outputFile string, fileList []string, concurre
 	// 显示最终进度
 	updateTarProgress(atomic.LoadInt64(&processedFiles), totalFiles, startTime)
 
-	if writeErr != nil {
-		return writeErr
+	writeErrMu.Lock()
+	err = writeErr
+	writeErrMu.Unlock()
+	if err != nil {
+		return err
 	}
 
 	if failedFiles > 0 {
@@ -279,39 +286,51 @@ func createTarParallel(sourceDir, outputFile string, fileList []string, concurre
 	return nil
 }
 
-// readFileForTar 读取文件并准备 tar header 和内容
-func readFileForTar(sourceDir, relPath string) ([]byte, *tar.Header, error) {
+// readFileHeaderForTar 读取文件信息并创建 tar header（不读文件内容）
+func readFileHeaderForTar(sourceDir, relPath string) (*tar.Header, error) {
 	fullPath := filepath.Join(sourceDir, relPath)
 
 	// 获取文件信息
 	fileInfo, err := os.Stat(fullPath)
 	if err != nil {
-		return nil, nil, err
-	}
-
-	// 打开文件
-	file, err := os.Open(fullPath)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer file.Close()
-
-	// 读取文件内容
-	content, err := io.ReadAll(file)
-	if err != nil {
-		return nil, nil, fmt.Errorf("读取文件内容失败: %w", err)
+		return nil, err
 	}
 
 	// 创建 tar header
 	header, err := tar.FileInfoHeader(fileInfo, "")
 	if err != nil {
-		return nil, nil, fmt.Errorf("创建 tar header 失败: %w", err)
+		return nil, fmt.Errorf("创建 tar header 失败: %w", err)
 	}
 
 	// 设置文件名（使用相对路径，确保路径使用斜杠）
 	header.Name = filepath.ToSlash(relPath)
 
-	return content, header, nil
+	return header, nil
+}
+
+// writeFileContentToTar 流式写入文件内容到 tar（优化内存占用）
+func writeFileContentToTar(sourceDir, relPath string, tarWriter *tar.Writer) error {
+	fullPath := filepath.Join(sourceDir, relPath)
+
+	// 打开文件
+	file, err := os.Open(fullPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// 从缓冲区池获取缓冲区
+	bufPtr := tarBufferPool.Get().(*[]byte)
+	defer tarBufferPool.Put(bufPtr)
+	buf := *bufPtr
+
+	// 使用流式复制，避免将整个文件读入内存
+	_, err = io.CopyBuffer(tarWriter, file, buf)
+	if err != nil {
+		return fmt.Errorf("流式写入文件内容失败: %w", err)
+	}
+
+	return nil
 }
 
 // writeManifestToTar 将 manifest 文件写入 tar 包

@@ -239,7 +239,6 @@ func createMultipleTarsParallel(sourceDir, outputDir string, fileChunks [][]stri
 
 // createSingleTarParallel 并行读取文件并生成单个 tar 包
 func createSingleTarParallel(sourceDir, outputFile string, fileList []string, concurrency int, globalProgress *int64) error {
-	totalFiles := int64(len(fileList))
 	var processedFiles int64
 	var failedFiles int64
 
@@ -250,93 +249,107 @@ func createSingleTarParallel(sourceDir, outputFile string, fileList []string, co
 	}
 	defer outFile.Close()
 
-	// 创建带缓冲的 writer 提高性能
-	bufferedWriter := bufio.NewWriterSize(outFile, 64*1024)
+	// 创建带缓冲的 writer 提高性能（增大缓冲区到 256KB）
+	bufferedWriter := bufio.NewWriterSize(outFile, 256*1024)
 	tarWriter := tar.NewWriter(bufferedWriter)
 	defer func() {
 		tarWriter.Close()
 		bufferedWriter.Flush()
 	}()
 
-	// 创建任务通道和数据通道
+	// 创建任务通道
 	taskChan := make(chan string, concurrency*2)
-	dataChan := make(chan *fileData, concurrency*2)
 
 	var wg sync.WaitGroup
-	var mu sync.Mutex
+	var mu sync.Mutex // 保护 tarWriter 的并发写入
 
-	// 启动文件读取工作协程（并行读取文件）
+	// 启动文件处理工作协程（并行读取文件并流式写入 tar）
+	var writeErr error
+	var writeErrMu sync.Mutex
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for relPath := range taskChan {
-				data := &fileData{relPath: relPath}
-				data.content, data.header, data.err = readFileForTar(sourceDir, relPath)
-				dataChan <- data
+				// 如果已经有写入错误，跳过后续处理
+				writeErrMu.Lock()
+				if writeErr != nil {
+					writeErrMu.Unlock()
+					atomic.AddInt64(&processedFiles, 1)
+					if globalProgress != nil {
+						atomic.AddInt64(globalProgress, 1)
+					}
+					continue
+				}
+				writeErrMu.Unlock()
+
+				// 读取文件 header（不读内容）
+				header, err := readFileHeaderForTar(sourceDir, relPath)
+				if err != nil {
+					mu.Lock()
+					if os.IsNotExist(err) {
+						fmt.Fprintf(os.Stderr, "警告: 源文件不存在: %s\n", filepath.Join(sourceDir, relPath))
+					} else {
+						fmt.Fprintf(os.Stderr, "警告: 读取文件失败 %s: %v\n", relPath, err)
+					}
+					mu.Unlock()
+					atomic.AddInt64(&failedFiles, 1)
+					atomic.AddInt64(&processedFiles, 1)
+					if globalProgress != nil {
+						atomic.AddInt64(globalProgress, 1)
+					}
+					continue
+				}
+
+				// 加锁保护 tarWriter（tar 格式要求串行写入）
+				mu.Lock()
+				// 再次检查错误
+				writeErrMu.Lock()
+				if writeErr != nil {
+					writeErrMu.Unlock()
+					mu.Unlock()
+					atomic.AddInt64(&processedFiles, 1)
+					if globalProgress != nil {
+						atomic.AddInt64(globalProgress, 1)
+					}
+					continue
+				}
+				writeErrMu.Unlock()
+
+				// 写入 tar header
+				if err := tarWriter.WriteHeader(header); err != nil {
+					writeErrMu.Lock()
+					writeErr = fmt.Errorf("写入 tar header 失败 %s: %w", relPath, err)
+					writeErrMu.Unlock()
+					mu.Unlock()
+					atomic.AddInt64(&processedFiles, 1)
+					if globalProgress != nil {
+						atomic.AddInt64(globalProgress, 1)
+					}
+					return
+				}
+
+				// 流式写入文件内容
+				if err := writeFileContentToTar(sourceDir, relPath, tarWriter); err != nil {
+					writeErrMu.Lock()
+					writeErr = fmt.Errorf("写入文件内容失败 %s: %w", relPath, err)
+					writeErrMu.Unlock()
+					mu.Unlock()
+					atomic.AddInt64(&processedFiles, 1)
+					if globalProgress != nil {
+						atomic.AddInt64(globalProgress, 1)
+					}
+					return
+				}
+
+				mu.Unlock()
+				atomic.AddInt64(&processedFiles, 1)
+				if globalProgress != nil {
+					atomic.AddInt64(globalProgress, 1)
+				}
 			}
 		}()
 	}
-
-	// 启动写入协程（串行写入 tar，保证格式正确）
-	writeDone := make(chan struct{})
-	var writeErr error
-	go func() {
-		defer close(writeDone)
-		processedCount := int64(0)
-		for processedCount < totalFiles {
-			data, ok := <-dataChan
-			if !ok {
-				// 通道已关闭，但还没处理完所有文件，说明有错误
-				if processedCount < totalFiles {
-					writeErr = fmt.Errorf("数据通道意外关闭，已处理 %d/%d 个文件", processedCount, totalFiles)
-				}
-				return
-			}
-
-			processedCount++
-			if data.err != nil {
-				mu.Lock()
-				if os.IsNotExist(data.err) {
-					fmt.Fprintf(os.Stderr, "警告: 源文件不存在: %s\n", filepath.Join(sourceDir, data.relPath))
-				} else {
-					fmt.Fprintf(os.Stderr, "警告: 读取文件失败 %s: %v\n", data.relPath, data.err)
-				}
-				mu.Unlock()
-				atomic.AddInt64(&failedFiles, 1)
-				atomic.AddInt64(&processedFiles, 1)
-				if globalProgress != nil {
-					atomic.AddInt64(globalProgress, 1)
-				}
-				continue
-			}
-
-			// 写入 tar header
-			if err := tarWriter.WriteHeader(data.header); err != nil {
-				writeErr = fmt.Errorf("写入 tar header 失败 %s: %w", data.relPath, err)
-				atomic.AddInt64(&processedFiles, 1)
-				if globalProgress != nil {
-					atomic.AddInt64(globalProgress, 1)
-				}
-				return
-			}
-
-			// 写入文件内容
-			if _, err := tarWriter.Write(data.content); err != nil {
-				writeErr = fmt.Errorf("写入文件内容失败 %s: %w", data.relPath, err)
-				atomic.AddInt64(&processedFiles, 1)
-				if globalProgress != nil {
-					atomic.AddInt64(globalProgress, 1)
-				}
-				return
-			}
-
-			atomic.AddInt64(&processedFiles, 1)
-			if globalProgress != nil {
-				atomic.AddInt64(globalProgress, 1)
-			}
-		}
-	}()
 
 	// 发送任务
 	for _, relPath := range fileList {
@@ -344,15 +357,14 @@ func createSingleTarParallel(sourceDir, outputFile string, fileList []string, co
 	}
 	close(taskChan)
 
-	// 等待所有读取协程完成
+	// 等待所有工作协程完成
 	wg.Wait()
-	close(dataChan)
 
-	// 等待写入协程完成
-	<-writeDone
-
-	if writeErr != nil {
-		return writeErr
+	writeErrMu.Lock()
+	err = writeErr
+	writeErrMu.Unlock()
+	if err != nil {
+		return err
 	}
 
 	if failedFiles > 0 {
