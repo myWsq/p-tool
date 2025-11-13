@@ -265,7 +265,7 @@ func extractTarParallel(tarFile, destDir string, concurrency int, useZstd bool) 
 		for {
 			select {
 			case <-ticker.C:
-				updateUntarProgress(atomic.LoadInt64(&processedFiles), totalFiles, startTime)
+				updateUntarProgressWithTotal(atomic.LoadInt64(&processedFiles), totalFiles, startTime)
 			case <-progressDone:
 				return
 			}
@@ -316,7 +316,7 @@ func extractTarParallel(tarFile, destDir string, concurrency int, useZstd bool) 
 	time.Sleep(120 * time.Millisecond)
 
 	// 显示最终进度
-	updateUntarProgress(atomic.LoadInt64(&processedFiles), totalFiles, startTime)
+	updateUntarProgressWithTotal(atomic.LoadInt64(&processedFiles), totalFiles, startTime)
 
 	if failedFiles > 0 {
 		return fmt.Errorf("有 %d 个文件解压失败", failedFiles)
@@ -500,4 +500,22 @@ func writeFileEntry(destDir, relPath string, entry *fileEntry) error {
 	}
 
 	return nil
+}
+
+// updateUntarProgressWithTotal 更新解压进度（带总数）
+func updateUntarProgressWithTotal(current, total int64, startTime time.Time) {
+	if total == 0 {
+		return
+	}
+	percentage := float64(current) / float64(total) * 100
+
+	// 计算每秒文件数
+	elapsed := time.Since(startTime)
+	var filesPerSec float64
+	if elapsed.Seconds() > 0 {
+		filesPerSec = float64(current) / elapsed.Seconds()
+	}
+
+	fmt.Fprintf(os.Stdout, "\r进度: %d/%d 文件 (%.1f%%) | 速度: %.1f 文件/秒", current, total, percentage, filesPerSec)
+	os.Stdout.Sync()
 }
