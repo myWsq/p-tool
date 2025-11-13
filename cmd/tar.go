@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/spf13/cobra"
 )
 
@@ -41,6 +42,7 @@ var tarCmd = &cobra.Command{
 
 		manifestFile, _ := cmd.Flags().GetString("manifest-file")
 		concurrency, _ := cmd.Flags().GetInt("concurrency")
+		useZstd, _ := cmd.Flags().GetBool("zstd")
 
 		// 验证源目录
 		sourceInfo, err := os.Stat(sourceDir)
@@ -92,7 +94,7 @@ var tarCmd = &cobra.Command{
 		fmt.Fprintf(os.Stdout, "开始打包 %d 个文件（并发数: %d）...\n", len(fileList), concurrency)
 
 		// 并行生成 tar 包
-		if err := createTarParallel(absSourceDir, outputFile, fileList, concurrency); err != nil {
+		if err := createTarParallel(absSourceDir, outputFile, fileList, concurrency, useZstd); err != nil {
 			fmt.Fprintf(os.Stderr, "错误: 生成 tar 包失败: %v\n", err)
 			os.Exit(1)
 		}
@@ -106,6 +108,7 @@ func init() {
 
 	tarCmd.Flags().String("manifest-file", "", "指定 manifest 文件路径（可选）")
 	tarCmd.Flags().Int("concurrency", 0, "指定并发数量，默认为 CPU 核数")
+	tarCmd.Flags().Bool("zstd", false, "使用 zstd 算法压缩 tar 包")
 }
 
 // fileData 用于在 goroutine 之间传递文件数据
@@ -117,7 +120,7 @@ type fileData struct {
 }
 
 // createTarParallel 并行读取文件并生成 tar 包
-func createTarParallel(sourceDir, outputFile string, fileList []string, concurrency int) error {
+func createTarParallel(sourceDir, outputFile string, fileList []string, concurrency int, useZstd bool) error {
 	totalFiles := int64(len(fileList))
 	var processedFiles int64
 	var failedFiles int64
@@ -134,9 +137,26 @@ func createTarParallel(sourceDir, outputFile string, fileList []string, concurre
 
 	// 创建带缓冲的 writer 提高性能
 	bufferedWriter := bufio.NewWriterSize(outFile, 64*1024)
-	tarWriter := tar.NewWriter(bufferedWriter)
+
+	// 根据 useZstd 标志决定是否使用 zstd 压缩
+	var writer io.Writer = bufferedWriter
+	var zstdEncoder *zstd.Encoder
+	if useZstd {
+		var err error
+		zstdEncoder, err = zstd.NewWriter(bufferedWriter, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(6)))
+		if err != nil {
+			return fmt.Errorf("创建 zstd 编码器失败: %w", err)
+		}
+		writer = zstdEncoder
+	}
+
+	tarWriter := tar.NewWriter(writer)
 	defer func() {
+		// 按顺序关闭：先关闭 tarWriter，再关闭 zstdEncoder，最后 flush buffer
 		tarWriter.Close()
+		if zstdEncoder != nil {
+			zstdEncoder.Close()
+		}
 		bufferedWriter.Flush()
 	}()
 

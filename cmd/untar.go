@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/spf13/cobra"
 )
 
@@ -39,6 +40,7 @@ var untarCmd = &cobra.Command{
 		destDir := args[1]
 
 		concurrency, _ := cmd.Flags().GetInt("concurrency")
+		useZstd, _ := cmd.Flags().GetBool("zstd")
 
 		// 验证 tar 文件
 		tarInfo, err := os.Stat(tarFile)
@@ -72,7 +74,7 @@ var untarCmd = &cobra.Command{
 		fmt.Fprintf(os.Stdout, "开始解压 tar 包（并发数: %d）...\n", concurrency)
 
 		// 并行解压 tar 包
-		if err := extractTarParallel(tarFile, absDestDir, concurrency); err != nil {
+		if err := extractTarParallel(tarFile, absDestDir, concurrency, useZstd); err != nil {
 			fmt.Fprintf(os.Stderr, "错误: 解压 tar 包失败: %v\n", err)
 			os.Exit(1)
 		}
@@ -85,6 +87,7 @@ func init() {
 	rootCmd.AddCommand(untarCmd)
 
 	untarCmd.Flags().Int("concurrency", 0, "指定并发数量，默认为 CPU 核数")
+	untarCmd.Flags().Bool("zstd", false, "解压缩经过 zstd 压缩的 tar 包")
 }
 
 // 缓冲区池，用于复用大缓冲区
@@ -102,7 +105,7 @@ type fileEntry struct {
 }
 
 // extractTarParallel 并行解压 tar 包
-func extractTarParallel(tarFile, destDir string, concurrency int) error {
+func extractTarParallel(tarFile, destDir string, concurrency int, useZstd bool) error {
 	// 打开 tar 文件
 	tarFileHandle, err := os.Open(tarFile)
 	if err != nil {
@@ -112,7 +115,19 @@ func extractTarParallel(tarFile, destDir string, concurrency int) error {
 
 	// 创建带缓冲的 reader 提高性能（使用1MB缓冲区）
 	bufferedReader := bufio.NewReaderSize(tarFileHandle, 1024*1024)
-	tarReader := tar.NewReader(bufferedReader)
+
+	// 根据 useZstd 标志决定是否使用 zstd 解压缩
+	var reader io.Reader = bufferedReader
+	if useZstd {
+		zstdDecoder, err := zstd.NewReader(bufferedReader)
+		if err != nil {
+			return fmt.Errorf("创建 zstd 解码器失败: %w", err)
+		}
+		defer zstdDecoder.Close()
+		reader = zstdDecoder
+	}
+
+	tarReader := tar.NewReader(reader)
 
 	// 第一步：读取所有文件数据到内存，并找到 manifest 文件
 	fileDataMap := make(map[string]*fileEntry)
