@@ -32,9 +32,20 @@ echo "源目录: $SOURCE_DIR"
 echo "临时目录: $TEMP_DIR"
 echo ""
 
-# 检查 p-tool 是否可用
-if ! command -v p-tool &> /dev/null; then
+# 检查 p-tool 是否可用（优先使用 ./p-tool）
+PTOOL_CMD=""
+if [ -f "./p-tool" ] && [ -x "./p-tool" ]; then
+    PTOOL_CMD="./p-tool"
+    echo "使用本地 p-tool: ./p-tool"
+elif command -v p-tool &> /dev/null; then
+    PTOOL_CMD="p-tool"
+    echo "使用系统 p-tool: p-tool"
+else
     echo "警告: p-tool 未找到，将跳过 p-tool 相关测试"
+    SKIP_PTOOL=true
+fi
+
+if [ -z "$PTOOL_CMD" ]; then
     SKIP_PTOOL=true
 else
     SKIP_PTOOL=false
@@ -132,7 +143,7 @@ if [ "$SKIP_PTOOL" = false ]; then
     echo "[$TEST_NUM/$TOTAL_TESTS] 测试 p-tool tar (不加 zstd)..."
     OUTPUT_FILE="$TEMP_DIR/ptool-tar.tar"
     START_TIME=$(get_timestamp)
-    if p-tool tar "$SOURCE_DIR" "$OUTPUT_FILE" 2>/dev/null; then
+    if $PTOOL_CMD tar "$SOURCE_DIR" "$OUTPUT_FILE" 2>/dev/null; then
         END_TIME=$(get_timestamp)
         ELAPSED=$(awk "BEGIN {printf \"%.3f\", $END_TIME - $START_TIME}")
         SIZE=$(get_file_size "$OUTPUT_FILE")
@@ -148,7 +159,7 @@ if [ "$SKIP_PTOOL" = false ]; then
         EXTRACT_DIR="$TEMP_DIR/extract-ptool-tar"
         mkdir -p "$EXTRACT_DIR"
         START_TIME=$(get_timestamp)
-        if p-tool untar "$OUTPUT_FILE" "$EXTRACT_DIR" 2>/dev/null; then
+        if $PTOOL_CMD untar "$OUTPUT_FILE" "$EXTRACT_DIR" 2>/dev/null; then
             END_TIME=$(get_timestamp)
             UNCOMPRESS_ELAPSED=$(awk "BEGIN {printf \"%.3f\", $END_TIME - $START_TIME}")
             UNCOMPRESS_TIMES+=("$UNCOMPRESS_ELAPSED")
@@ -176,7 +187,7 @@ if [ "$SKIP_PTOOL" = false ]; then
     echo "[$TEST_NUM/$TOTAL_TESTS] 测试 p-tool tar (加 zstd)..."
     OUTPUT_FILE="$TEMP_DIR/ptool-tar-zstd.tar.zst"
     START_TIME=$(get_timestamp)
-    if p-tool tar "$SOURCE_DIR" "$OUTPUT_FILE" --zstd 2>/dev/null; then
+    if $PTOOL_CMD tar "$SOURCE_DIR" "$OUTPUT_FILE" --zstd 2>/dev/null; then
         END_TIME=$(get_timestamp)
         ELAPSED=$(awk "BEGIN {printf \"%.3f\", $END_TIME - $START_TIME}")
         SIZE=$(get_file_size "$OUTPUT_FILE")
@@ -192,7 +203,7 @@ if [ "$SKIP_PTOOL" = false ]; then
         EXTRACT_DIR="$TEMP_DIR/extract-ptool-tar-zstd"
         mkdir -p "$EXTRACT_DIR"
         START_TIME=$(get_timestamp)
-        if p-tool untar "$OUTPUT_FILE" "$EXTRACT_DIR" --zstd 2>/dev/null; then
+        if $PTOOL_CMD untar "$OUTPUT_FILE" "$EXTRACT_DIR" --zstd 2>/dev/null; then
             END_TIME=$(get_timestamp)
             UNCOMPRESS_ELAPSED=$(awk "BEGIN {printf \"%.3f\", $END_TIME - $START_TIME}")
             UNCOMPRESS_TIMES+=("$UNCOMPRESS_ELAPSED")
