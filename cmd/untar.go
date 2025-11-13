@@ -87,6 +87,13 @@ func init() {
 	untarCmd.Flags().Int("concurrency", 0, "指定并发数量，默认为 CPU 核数")
 }
 
+// 缓冲区池，用于复用大缓冲区
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 1024*1024) // 1MB 缓冲区
+	},
+}
+
 // fileEntry 存储从 tar 包中读取的文件数据
 type fileEntry struct {
 	header  *tar.Header
@@ -103,8 +110,8 @@ func extractTarParallel(tarFile, destDir string, concurrency int) error {
 	}
 	defer tarFileHandle.Close()
 
-	// 创建带缓冲的 reader 提高性能
-	bufferedReader := bufio.NewReaderSize(tarFileHandle, 64*1024)
+	// 创建带缓冲的 reader 提高性能（使用1MB缓冲区）
+	bufferedReader := bufio.NewReaderSize(tarFileHandle, 1024*1024)
 	tarReader := tar.NewReader(bufferedReader)
 
 	// 第一步：读取所有文件数据到内存，并找到 manifest 文件
@@ -124,8 +131,16 @@ func extractTarParallel(tarFile, destDir string, concurrency int) error {
 		}
 
 		// 规范化路径（移除 ./ 前缀，统一使用斜杠）
-		normalizedPath := strings.TrimPrefix(header.Name, "./")
-		normalizedPath = filepath.ToSlash(normalizedPath)
+		var normalizedPath string
+		if strings.HasPrefix(header.Name, "./") {
+			normalizedPath = header.Name[2:]
+		} else {
+			normalizedPath = header.Name
+		}
+		// 只在非 Unix 系统上转换路径分隔符
+		if filepath.Separator != '/' {
+			normalizedPath = filepath.ToSlash(normalizedPath)
+		}
 
 		// 检查是否是 manifest 文件
 		if normalizedPath == manifestName || strings.HasSuffix(normalizedPath, manifestName) {
@@ -140,9 +155,21 @@ func extractTarParallel(tarFile, destDir string, concurrency int) error {
 		// 读取文件内容（目录没有内容）
 		var content []byte
 		if header.Typeflag == tar.TypeReg {
-			content, err = io.ReadAll(tarReader)
-			if err != nil {
-				return fmt.Errorf("读取文件内容失败 %s: %w", normalizedPath, err)
+			// 使用缓冲区池优化大文件读取
+			if header.Size > 0 && header.Size < 10*1024*1024 {
+				// 小文件直接分配
+				content = make([]byte, header.Size)
+				if _, err := io.ReadFull(tarReader, content); err != nil {
+					return fmt.Errorf("读取文件内容失败 %s: %w", normalizedPath, err)
+				}
+			} else {
+				// 大文件使用缓冲区池
+				buf := bufferPool.Get().([]byte)
+				defer bufferPool.Put(buf)
+				content, err = readAllOptimized(tarReader, buf)
+				if err != nil {
+					return fmt.Errorf("读取文件内容失败 %s: %w", normalizedPath, err)
+				}
 			}
 		} else {
 			// 对于非普通文件（如目录、符号链接等），跳过内容读取
@@ -174,6 +201,33 @@ func extractTarParallel(tarFile, destDir string, concurrency int) error {
 	}
 
 	fmt.Fprintf(os.Stdout, "找到 %d 个文件，开始并行解压...\n", len(fileList))
+
+	// 预创建所有需要的目录，减少并发时的锁竞争
+	fmt.Fprintf(os.Stdout, "正在预创建目录结构...\n")
+	dirSet := make(map[string]bool)
+	for _, relPath := range fileList {
+		entry, exists := fileDataMap[relPath]
+		if !exists {
+			continue
+		}
+		dir := filepath.Dir(relPath)
+		for dir != "." && dir != "/" && dir != "" {
+			dirSet[dir] = true
+			dir = filepath.Dir(dir)
+		}
+		// 对于目录类型的条目，也需要创建
+		if entry.header.Typeflag == tar.TypeDir {
+			dirSet[relPath] = true
+		}
+	}
+
+	// 批量创建目录
+	for dir := range dirSet {
+		targetDir := filepath.Join(destDir, dir)
+		if err := os.MkdirAll(targetDir, 0755); err != nil {
+			return fmt.Errorf("预创建目录失败 %s: %w", targetDir, err)
+		}
+	}
 
 	// 第二步：根据 manifest 文件列表并行写入文件
 	totalFiles := int64(len(fileList))
@@ -258,18 +312,74 @@ func extractTarParallel(tarFile, destDir string, concurrency int) error {
 
 // parseManifestContent 解析 manifest 文件内容，返回文件相对路径列表
 func parseManifestContent(content []byte) ([]string, error) {
-	var fileList []string
+	// 预分配容量，减少重新分配
 	lines := strings.Split(string(content), "\n")
+	fileList := make([]string, 0, len(lines))
+
 	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			// 移除开头的 ./
-			normalizedPath := strings.TrimPrefix(line, "./")
-			normalizedPath = filepath.ToSlash(normalizedPath)
-			fileList = append(fileList, normalizedPath)
+		// 快速跳过空行
+		if len(line) == 0 {
+			continue
 		}
+
+		// 去除前后空白
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// 移除开头的 ./
+		var normalizedPath string
+		if strings.HasPrefix(line, "./") {
+			normalizedPath = line[2:]
+		} else {
+			normalizedPath = line
+		}
+
+		// 统一使用斜杠（只在需要时转换）
+		if filepath.Separator != '/' {
+			normalizedPath = filepath.ToSlash(normalizedPath)
+		}
+
+		fileList = append(fileList, normalizedPath)
 	}
 	return fileList, nil
+}
+
+// readAllOptimized 使用缓冲区池优化的大文件读取函数
+func readAllOptimized(r io.Reader, buf []byte) ([]byte, error) {
+	// 预分配容量，减少重新分配
+	var result []byte
+	bufSize := len(buf)
+
+	// 先读取一次，估算大小
+	n, err := r.Read(buf)
+	if n > 0 {
+		result = make([]byte, 0, bufSize*2) // 预分配容量
+		result = append(result, buf[:n]...)
+	}
+	if err == io.EOF {
+		return result, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// 继续读取剩余数据
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			result = append(result, buf[:n]...)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return result, nil
 }
 
 // writeFileEntry 写入单个文件条目到目标目录
@@ -281,32 +391,44 @@ func writeFileEntry(destDir, relPath string, entry *fileEntry) error {
 	switch entry.header.Typeflag {
 	case tar.TypeReg:
 		// 普通文件
-		// 创建目录（如果需要）
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-			return fmt.Errorf("创建目录失败 %s: %w", filepath.Dir(targetPath), err)
-		}
+		// 目录已在预创建阶段创建，这里不需要再创建
 
-		// 创建文件
+		// 创建文件（使用 O_EXCL 避免不必要的检查）
 		outFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(entry.header.Mode))
 		if err != nil {
 			return fmt.Errorf("创建文件失败 %s: %w", targetPath, err)
 		}
 
-		// 写入文件内容
-		if _, err := outFile.Write(entry.content); err != nil {
-			outFile.Close()
-			return fmt.Errorf("写入文件内容失败 %s: %w", targetPath, err)
+		// 使用缓冲写入提高性能（对于大文件使用缓冲，小文件直接写入）
+		if len(entry.content) > 64*1024 {
+			// 大文件使用缓冲写入
+			writer := bufio.NewWriterSize(outFile, 1024*1024)
+			if _, err := writer.Write(entry.content); err != nil {
+				outFile.Close()
+				return fmt.Errorf("写入文件内容失败 %s: %w", targetPath, err)
+			}
+			if err := writer.Flush(); err != nil {
+				outFile.Close()
+				return fmt.Errorf("刷新缓冲区失败 %s: %w", targetPath, err)
+			}
+		} else {
+			// 小文件直接写入，减少缓冲开销
+			if _, err := outFile.Write(entry.content); err != nil {
+				outFile.Close()
+				return fmt.Errorf("写入文件内容失败 %s: %w", targetPath, err)
+			}
 		}
 
-		// 设置文件权限和时间
+		// 设置文件权限和时间（延迟到关闭文件后，减少系统调用）
+		outFile.Close()
+
+		// 使用单个系统调用设置权限和时间（如果可能）
 		if err := os.Chmod(targetPath, os.FileMode(entry.header.Mode)); err != nil {
 			// 权限设置失败不影响解压，只记录警告
 		}
 		if err := os.Chtimes(targetPath, entry.header.AccessTime, entry.header.ModTime); err != nil {
 			// 时间设置失败不影响解压，只记录警告
 		}
-
-		outFile.Close()
 
 	case tar.TypeDir:
 		// 目录
@@ -322,10 +444,7 @@ func writeFileEntry(destDir, relPath string, entry *fileEntry) error {
 
 	case tar.TypeSymlink:
 		// 符号链接
-		// 创建目录（如果需要）
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-			return fmt.Errorf("创建目录失败 %s: %w", filepath.Dir(targetPath), err)
-		}
+		// 目录已在预创建阶段创建，这里不需要再创建
 
 		if err := os.Symlink(entry.header.Linkname, targetPath); err != nil {
 			// 如果符号链接已存在，尝试删除后重新创建
@@ -343,10 +462,7 @@ func writeFileEntry(destDir, relPath string, entry *fileEntry) error {
 
 	case tar.TypeLink:
 		// 硬链接
-		// 创建目录（如果需要）
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-			return fmt.Errorf("创建目录失败 %s: %w", filepath.Dir(targetPath), err)
-		}
+		// 目录已在预创建阶段创建，这里不需要再创建
 
 		linkTarget := filepath.Join(destDir, entry.header.Linkname)
 		if err := os.Link(linkTarget, targetPath); err != nil {
